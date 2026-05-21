@@ -1,9 +1,12 @@
 import cv2
 import base64
+import time
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from .state import GraphState
-from .config import MODEL_NAME, API_KEY, BASE_URL
+from .config import MODEL_NAME, API_KEY, BASE_URL, is_baseline
+from .video_utils import extract_frames as video_extract_frames, get_sampled_indices
+from .memory_builder import build_memory, format_memory_for_prompt, format_path_timeline
 
 # ── Category-specific prompts ─────────────────────────────────────────
 # Structured Spatial Chain-of-Thought (Spatial CoT) prompts
@@ -30,42 +33,69 @@ CATEGORY_PROMPTS = {
         "Question: {question}\n\n"
         "Focus your [Topological Reasoning] on comparing the final frames with the navigation steps: which step did you "
         "just complete before arriving at the final viewpoint? Pay strict attention to turns, altitude changes, and landmarks.\n\n"
+        "Progress determination: Compare the visual evidence across the sampled frames with each navigation instruction step. "
+        "Determine which step's completion is best supported by the visible scene state, landmarks, and agent position. "
+        "Do NOT infer progress from frame position or timestamp alone — the last frame does not necessarily mean the task "
+        "is complete. Match against actual visual evidence only.\n\n"
         "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 
     "Action Generation": (
         SPATIAL_COT_BASE +
-        "You are an embodied agent navigating in a first-person urban view. Determine the next action to take.\n\n"
+        "You are a drone navigating in a first-person urban view. Determine the SINGLE best next action.\n\n"
         "Question: {question}\n\n"
-        "In your [Coordinate Mapping], explicitly note your current altitude and orientation. In your [Topological Reasoning], "
-        "match your current 3D position against the instruction sequence to find the next required move (e.g., if target is higher, you must rise).\n\n"
+        "CRITICAL — PAST vs FUTURE: First, identify which navigation steps have ALREADY been executed "
+        "(visible in earlier frames) and which steps are yet to be executed (FUTURE). The correct answer "
+        "is the NEXT FUTURE step, not a past one.\n\n"
+        "In your [Coordinate Mapping], explicitly note your current altitude (high/mid/low), orientation "
+        "(forward direction), and 3D position. In your [Topological Reasoning], match your current 3D "
+        "state against the instruction sequence: if the target is higher you must rise, if it's to your "
+        "right you must turn right. Exclude options that are inconsistent with your current motion trend "
+        "and altitude trajectory.\n\n"
         "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 
     "Landmark Position": (
         SPATIAL_COT_BASE +
-        "You are an embodied agent. Determine your position relative to a landmark.\n\n"
+        "You are a drone flying in an urban environment. Determine your spatial position relative to a landmark.\n\n"
         "Question: {question}\n\n"
-        "In your [Topological Reasoning], strictly differentiate between Ego-centric (your perspective) and Allocentric (global) views. "
-        "Are you above, beside, facing, or across from the landmark?\n\n"
+        "VIEWPOINT DISAMBIGUATION protocol:\n"
+        "1. Declare your reference frame: are you using screen-based (what the camera sees) or ego-centered "
+        "(your own body/drone orientation)? You MUST use ego-centered for the final answer.\n"
+        "2. Transformation rule: Screen-left + forward heading → ego-left. Screen-right + forward heading → ego-right. "
+        "Screen-top + no forward tilt → ego-above. Screen-bottom + downward tilt → ego-below.\n"
+        "3. In your [Topological Reasoning], determine: Are you above, beside, facing, behind, or across from the landmark? "
+        "Consider both your 3D position AND your heading direction relative to the landmark's position.\n\n"
         "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 
     "Goal Detection": (
         SPATIAL_COT_BASE +
-        "You are an embodied agent navigating to a specific destination in an urban environment.\n\n"
+        "You are a drone navigating to a specific destination in an urban environment.\n\n"
         "Question: {question}\n\n"
-        "In your [Visual Anchors], look carefully for the target destination (e.g., a specific floor balcony, entrance). "
-        "In your [Coordinate Mapping], precisely locate it in the frame (e.g., top-right, mid-depth).\n\n"
+        "THREE-LEVEL VISIBILITY HIERARCHY — check each level in order:\n"
+        "  Level 1: Is the target BUILDING visible in any frame? Identify it by shape, color, height.\n"
+        "  Level 2: Is the target FLOOR/LEVEL visible? Look for floor-specific features (balconies, windows, signage).\n"
+        "  Level 3: Is the PRECISE target (e.g., a specific balcony or entrance) visually identifiable?\n\n"
+        "In your [Visual Anchors], scan each frame systematically using this hierarchy. "
+        "In your [Coordinate Mapping], locate the target at the highest level you can confirm. "
+        "If Level 3 is not reachable, base your answer on the highest confirmed level.\n\n"
         "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 
     "High-level Planning": (
         SPATIAL_COT_BASE +
-        "You are an embodied agent navigating an urban environment to reach a destination.\n\n"
+        "You are a drone planning a navigation route in an urban 3D environment.\n\n"
         "Question: {question}\n\n"
-        "In your [Topological Reasoning], project a 3D path from your current position to the destination. "
-        "What is the most logical intermediate object or location to approach next based on actual visual evidence?\n\n"
+        "DRONE AERIAL NAVIGATION PARADIGM — the shortest path between two points in 3D space is a "
+        "STRAIGHT LINE through the air, NOT a ground-level walking path along streets or sidewalks. "
+        "You can fly OVER buildings, THROUGH open spaces between structures, and DIRECTLY toward "
+        "elevated targets.\n\n"
+        "In your [Topological Reasoning]:\n"
+        "1. Identify the destination's 3D position (which building, which floor/height).\n"
+        "2. Determine your current 3D position (altitude, facing direction, nearby structures).\n"
+        "3. Project the aerial straight-line path — what is the FIRST intermediate object or location "
+        "you must approach to stay on the 3D shortest path? This is NOT a ground navigation problem.\n\n"
         "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 
@@ -80,10 +110,17 @@ CATEGORY_PROMPTS = {
 
     "Association Reasoning": (
         SPATIAL_COT_BASE +
-        "You are an embodied agent navigating toward a specific target.\n\n"
+        "You are a drone navigating toward a specific target in an urban environment.\n\n"
         "Question: {question}\n\n"
-        "If the target is not directly visible, use [Topological Reasoning] to identify which visible object is most spatially relevant "
-        "to orient toward the target.\n\n"
+        "SPATIAL ASSOCIATION protocol — when the target itself is not directly visible, you must identify "
+        "which VISIBLE object serves as the best spatial proxy or intermediate waypoint.\n\n"
+        "In your [Visual Anchors]: enumerate ALL distinctive visible objects (buildings, roads, landmarks).\n"
+        "In your [Coordinate Mapping]: place each object relative to your current viewpoint.\n"
+        "In your [Topological Reasoning]:\n"
+        "1. Which visible object is physically CLOSEST to the target's known or inferred position?\n"
+        "2. Which visible object shares the same spatial context (same building, same side of street, same altitude)?\n"
+        "3. Which object, if you approach it, best positions you for the final leg to the target?\n"
+        "Select the object with the strongest spatial association to the target.\n\n"
         "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 
@@ -91,10 +128,14 @@ CATEGORY_PROMPTS = {
     # ═══ Recall & Perception ═══
 
     "Trajectory Captioning": (
-        "You are an embodied agent. Summarize your movement route from the video.\n\n"
+        "You are a drone. Summarize your complete movement route from the video.\n\n"
         "Question: {question}\n\n"
-        "Note your starting point (first frames), your ending point (last frames), "
-        "and the overall path: direction, altitude changes, and any turns.\n\n"
+        "Trace your FULL 3D trajectory in chronological order:\n"
+        "1. Starting point: exact location and altitude at the first frame.\n"
+        "2. Movement path: every turn (left/right), altitude change (rise/descend/flat), and direction change.\n"
+        "3. Ending point: exact location and altitude at the last frame.\n"
+        "4. Overall pattern: describe the complete route as a sequence (e.g., 'flew forward over X, "
+        "turned right toward Y, descended to Z').\n\n"
         "Provide your answer as 'Option: [X]' where X is the letter."
     ),
 
@@ -144,9 +185,13 @@ CATEGORY_PROMPTS = {
     "Start/End Position": (
         "Identify your position at the start or end of the video.\n\n"
         "Question: {question}\n\n"
-        "Look at the first frames for the starting position, or the last frames for "
-        "the ending position. Note landmarks, buildings, roads, and other features "
-        "visible at that moment.\n\n"
+        "Determine whether the question asks about the START (first frames) or END (last frames).\n"
+        "For START: focus exclusively on frames 1-3. Identify the exact location, nearby landmarks, "
+        "altitude, and what is directly ahead/below/around you.\n"
+        "For END: focus exclusively on the last 3 frames. Identify the final location, what you are "
+        "facing, and any distinctive structures at that position.\n"
+        "Be precise — distinguish between similar-looking locations by noting specific landmarks, "
+        "altitude differences, and spatial layout differences.\n\n"
         "Provide your answer as 'Option: [X]' where X is the letter."
     ),
 
@@ -180,17 +225,15 @@ def build_prompt_text(question: str, question_category: str) -> str:
     return template.format(question=question)
 
 
-def extract_frames(video_path: str, num_frames: int = 16, max_size: int = 768) -> list[str]:
-    """Extract frames with uniform sampling across the full video.
-
-    Returns list of base64-encoded JPEG strings.
-    """
+def _uniform_frames(video_path: str, num_frames: int = 16, max_size: int = 768) -> list[str]:
+    """Uniform sampling — used only for BASELINE_CATEGORIES."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return []
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total_frames == 0:
+        cap.release()
         return []
 
     step = max(total_frames // num_frames, 1)
@@ -209,6 +252,9 @@ def extract_frames(video_path: str, num_frames: int = 16, max_size: int = 768) -
             scale = max_size / max(h, w)
             new_w, new_h = int(w * scale), int(h * scale)
             frame = cv2.resize(frame, (new_w, new_h))
+        text = f"Frame {i+1}/{num_frames}"
+        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 1, cv2.LINE_AA)
         _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         frames_base64.append(base64.b64encode(buffer).decode('utf-8'))
 
@@ -223,17 +269,51 @@ def reasoner_node(state: GraphState):
         video_path = state.get("video_path")
         question = state.get("question")
         question_category = state.get("question_category", "")
-        spatial_memory = state.get("spatial_memory", {})
 
-        frames = extract_frames(video_path, 16)
-        prompt_text = build_prompt_text(question, question_category)
-        
-        # Inject spatial memory context if available
-        if spatial_memory:
-            memory_context = "\n[Spatial Memory Context]:\n"
-            for key, val in spatial_memory.items():
-                memory_context += f"- {key}: {val}\n"
-            prompt_text = memory_context + "\n" + prompt_text
+        baseline = is_baseline(question_category)
+
+        if baseline:
+            # BASELINE_CATEGORIES: uniform sampling, simple prompt, no memory
+            frames = _uniform_frames(video_path, 16)
+            prompt_text = DEFAULT_PROMPT.format(question=question)
+            # Store empty spatial_memory so verifier skips properly
+            new_spatial_memory = {}
+        else:
+            # Spatial / Step-Match: category-specific sampling + Spatial CoT + MemoryBuilder
+            frames = video_extract_frames(
+                video_path, 16, max_size=768,
+                question=question, question_category=question_category,
+            )
+
+            # Get the frame indices that were sampled (for MemoryBuilder metadata)
+            frame_indices = get_sampled_indices(
+                video_path, 16,
+                question=question, question_category=question_category,
+            )
+
+            # Build programmatic spatial memory (no LLM call)
+            from .frame_selector import CATEGORY_SAMPLING_MODE
+            sampling_mode = CATEGORY_SAMPLING_MODE.get(question_category, "uniform")
+            spatial_memory = build_memory(
+                video_path=video_path,
+                frame_indices=frame_indices,
+                question_category=question_category,
+                sampling_mode=sampling_mode,
+                question=question,
+            )
+            new_spatial_memory = spatial_memory
+
+            prompt_text = build_prompt_text(question, question_category)
+
+            # Inject programmatic spatial memory context
+            memory_context = spatial_memory.get("formatted_context", "")
+            if memory_context:
+                # Add movement timeline for Progress Evaluation
+                if question_category == "Progress Evaluation":
+                    timeline = format_path_timeline(spatial_memory)
+                    if timeline:
+                        memory_context += "\n" + timeline + "\n"
+                prompt_text = memory_context + "\n" + prompt_text
 
         content = [{"type": "text", "text": prompt_text}]
 
@@ -247,8 +327,10 @@ def reasoner_node(state: GraphState):
         messages_to_send = [initial_msg]
         new_messages = [initial_msg]
     else:
+        # Retry: verifier challenge or validator retry — forward existing messages
         messages_to_send = messages
         new_messages = []
+        new_spatial_memory = state.get("spatial_memory", {})
 
     llm = ChatOpenAI(
         model=MODEL_NAME,
@@ -258,11 +340,10 @@ def reasoner_node(state: GraphState):
         timeout=120,
         max_retries=3
     )
-    
-    import time
+
     max_custom_retries = 3
     response = None
-    
+
     for attempt in range(max_custom_retries):
         try:
             print(f"  -> [Reasoner] Sending request to LLM (Model: {MODEL_NAME}), Attempt {attempt + 1}/{max_custom_retries}...")
@@ -272,21 +353,13 @@ def reasoner_node(state: GraphState):
         except Exception as e:
             print(f"  -> [Reasoner] API Error on attempt {attempt + 1}: {e}")
             if attempt < max_custom_retries - 1:
-                print(f"  -> [Reasoner] Retrying in 3 seconds...")
-                time.sleep(3)  # 等待3秒后重试
+                delay = 3 * (2 ** attempt)  # 指数退避: 3s → 6s → 12s
+                print(f"  -> [Reasoner] Retrying in {delay}s...")
+                time.sleep(delay)
             else:
                 print(f"  -> [Reasoner] Failed after {max_custom_retries} attempts.")
                 raise e
 
     new_messages.append(response)
-
-    # Simplified spatial memory extraction logic:
-    # We will update spatial memory by parsing the LLM response for [Coordinate Mapping] or [Visual Anchors]
-    # In a full implementation, a separate memory_node could extract and format this more rigorously.
-    new_spatial_memory = state.get("spatial_memory", {})
-    if isinstance(response.content, str):
-        if "Step 1 [Visual Anchors]:" in response.content:
-             # Just store the raw thought process temporarily to aid the next step if this was a multi-step graph
-             pass
 
     return {"messages": new_messages, "spatial_memory": new_spatial_memory}
