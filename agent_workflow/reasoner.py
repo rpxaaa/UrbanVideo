@@ -4,7 +4,7 @@ import time
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from .state import GraphState
-from .config import MODEL_NAME, API_KEY, BASE_URL, is_baseline
+from .config import MODEL_NAME, API_KEY, BASE_URL, is_baseline, get_frame_count
 from .video_utils import extract_frames as video_extract_frames, get_sampled_indices
 from .memory_builder import build_memory, format_memory_for_prompt, format_path_timeline
 
@@ -44,14 +44,23 @@ CATEGORY_PROMPTS = {
         SPATIAL_COT_BASE +
         "You are a drone navigating in a first-person urban view. Determine the SINGLE best next action.\n\n"
         "Question: {question}\n\n"
-        "CRITICAL — PAST vs FUTURE: First, identify which navigation steps have ALREADY been executed "
-        "(visible in earlier frames) and which steps are yet to be executed (FUTURE). The correct answer "
-        "is the NEXT FUTURE step, not a past one.\n\n"
-        "In your [Coordinate Mapping], explicitly note your current altitude (high/mid/low), orientation "
-        "(forward direction), and 3D position. In your [Topological Reasoning], match your current 3D "
-        "state against the instruction sequence: if the target is higher you must rise, if it's to your "
-        "right you must turn right. Exclude options that are inconsistent with your current motion trend "
-        "and altitude trajectory.\n\n"
+        "INSTRUCTION AUDIT (MANDATORY — do this BEFORE selecting an answer):\n"
+        "1. Parse the navigation instruction into individual steps. List them as Step 1, Step 2, Step 3, etc.\n"
+        "2. For EACH step, inspect the video frames and mark it as [DONE] or [PENDING]:\n"
+        "   - [DONE] = visual evidence in the frames confirms this step was executed "
+        "(look for: the turn happened, the altitude changed, the landmark appeared)\n"
+        "   - [PENDING] = no visual evidence confirms completion, or the current state is before this step\n"
+        "3. Identify the FIRST [PENDING] step — this is your target. "
+        "CRITICAL: the last frame is NOT necessarily the end of the task. "
+        "The video may end before all steps complete, or may capture only part of the route.\n"
+        "4. Now match this target step against your current 3D state (altitude, orientation, position):\n"
+        "   - If target says 'turn right' but you already turned right → mark it [DONE], re-evaluate\n"
+        "   - If target says 'go up' and you are still at low altitude → the next action IS going up\n"
+        "   - If target says 'approach X' and X is not yet visible → you must move toward where X would be\n"
+        "5. Select the option that EXECUTES the first [PENDING] step.\n\n"
+        "In your [Coordinate Mapping], note altitude, heading direction, and nearby landmarks. "
+        "In your [Topological Reasoning], match the first [PENDING] step against your current state. "
+        "Exclude options that re-execute already-completed steps or are inconsistent with the required movement direction.\n\n"
         "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 
@@ -271,23 +280,24 @@ def reasoner_node(state: GraphState):
         question_category = state.get("question_category", "")
 
         baseline = is_baseline(question_category)
+        num_frames = get_frame_count(question_category)
 
         if baseline:
             # BASELINE_CATEGORIES: uniform sampling, simple prompt, no memory
-            frames = _uniform_frames(video_path, 16)
+            frames = _uniform_frames(video_path, num_frames)
             prompt_text = DEFAULT_PROMPT.format(question=question)
             # Store empty spatial_memory so verifier skips properly
             new_spatial_memory = {}
         else:
             # Spatial / Step-Match: category-specific sampling + Spatial CoT + MemoryBuilder
             frames = video_extract_frames(
-                video_path, 16, max_size=768,
+                video_path, num_frames, max_size=768,
                 question=question, question_category=question_category,
             )
 
             # Get the frame indices that were sampled (for MemoryBuilder metadata)
             frame_indices = get_sampled_indices(
-                video_path, 16,
+                video_path, num_frames,
                 question=question, question_category=question_category,
             )
 
