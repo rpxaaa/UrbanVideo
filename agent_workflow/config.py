@@ -19,8 +19,16 @@ VERIFIER_CATEGORIES = {
 # Note: Goal Detection removed — Verifier caused -13.34pp regression
 # due to evidence_summary lacking fine-grained visual details for floor/balcony search
 
-# 视频帧数配置
-REASONER_FRAMES = int(os.getenv("REASONER_FRAMES", "16"))
+# 视频帧数配置 — API限制每请求最多16帧
+DEFAULT_FRAMES = int(os.getenv("REASONER_FRAMES", "16"))
+
+# 类别专属帧预算（需保持在16帧API限制内，通过收紧采样策略补偿）
+CATEGORY_FRAME_BUDGET: dict[str, int] = {}
+
+
+def get_frame_count(category: str) -> int:
+    """返回某类别应使用的帧数。未配置的类别使用 DEFAULT_FRAMES。"""
+    return CATEGORY_FRAME_BUDGET.get(category, DEFAULT_FRAMES)
 
 
 def is_baseline(category: str) -> bool:
