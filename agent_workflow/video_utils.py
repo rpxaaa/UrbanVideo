@@ -15,8 +15,12 @@ def extract_frames(video_path: str, num_frames: int = 16, max_size: int = 768,
 
     Returns list of base64-encoded JPEG strings with frame-number watermarks.
     """
+    if not video_path:
+        print(f"  [WARN] extract_frames: empty video_path, skipping")
+        return []
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
+        print(f"  [WARN] extract_frames: cannot open '{video_path}', skipping")
         return []
 
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -67,6 +71,8 @@ def get_sampled_indices(video_path: str, num_frames: int = 16,
 
     Useful for MemoryBuilder which needs to know which frames were selected.
     """
+    if not video_path:
+        return []
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return []

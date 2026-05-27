@@ -26,6 +26,8 @@ CATEGORY_SAMPLING_MODE: dict[str, str] = {
     "Proximity":             "change_focus",
     "Causal":                "cause_effect",
     "Counterfactual":        "decision_focus",
+    "Sequence Recall":       "sequence_focus",
+    "Duration":              "duration_compare",
 }
 
 # BASELINE_CATEGORIES always use "uniform" — this is enforced in reasoner_node,
@@ -203,6 +205,8 @@ def _find_anchor_frame(
     Samples 48 evenly-spaced frames, computes histogram correlation between
     consecutive frames, returns indices with the lowest correlation (most change).
     """
+    if not video_path:
+        return [total_frames // 2]
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return [total_frames // 2]
@@ -259,6 +263,54 @@ def _change_focus(total_frames: int, num_frames: int,
     return sorted(set(anchor_frames + uniform_frames))
 
 
+def _sequence_focus(total_frames: int, num_frames: int) -> list[int]:
+    """Dense early+mid coverage (50% budget in 0-65%) + uniform rest.
+
+    Sequence questions ask "what happens NEXT after event X". The model needs
+    dense early+mid frames to locate event X, then the remaining frames show
+    what follows. Avoiding tail-heavy bias ensures the model doesn't confuse
+    "what happened next" with "what happened at the end."
+    """
+    early_end = int(total_frames * 0.65)
+    early_n = max(int(num_frames * 0.50), 6)
+    late_n = num_frames - early_n
+
+    early = _uniform_range(0, early_end, early_n)
+    late = _uniform_range(early_end, total_frames, late_n)
+    return sorted(set(early + late))
+
+
+def _duration_compare(total_frames: int, num_frames: int) -> list[int]:
+    """Balanced coverage across 4 quarters — for Duration comparison.
+
+    Duration questions compare time lengths of different segments. Need equal
+    coverage across the whole video so the model can count frames for each
+    segment being compared. Avoids over-concentration in any one region.
+    """
+    q1_end = int(total_frames * 0.25)
+    q2_end = int(total_frames * 0.50)
+    q3_end = int(total_frames * 0.75)
+
+    n_each = max(num_frames // 4, 1)
+    q1 = _uniform_range(0, q1_end, n_each)
+    q2 = _uniform_range(q1_end, q2_end, n_each)
+    q3 = _uniform_range(q2_end, q3_end, n_each)
+    q4 = _uniform_range(q3_end, total_frames, n_each)
+
+    indices = sorted(set(q1 + q2 + q3 + q4))
+    # Fill to budget if quarters under-filled
+    if len(indices) < num_frames:
+        fill = _uniform(total_frames, num_frames)
+        existing = set(indices)
+        for f in fill:
+            if len(indices) >= num_frames:
+                break
+            if f not in existing:
+                indices.append(f)
+                existing.add(f)
+    return sorted(indices)[:num_frames]
+
+
 def _cause_effect(total_frames: int, num_frames: int,
                   video_path: str = "", **_kw) -> list[int]:
     """Two anchors (±4 / ±2 windows) + uniform fill."""
@@ -301,6 +353,8 @@ _STRATEGIES: dict[str, Callable[..., list[int]]] = {
     "decision_focus":      _decision_focus,
     "change_focus":        _change_focus,
     "cause_effect":        _cause_effect,
+    "sequence_focus":      _sequence_focus,
+    "duration_compare":    _duration_compare,
 }
 
 

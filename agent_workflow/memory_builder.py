@@ -18,6 +18,8 @@ from typing import Optional
 
 def _get_video_meta(video_path: str) -> dict:
     """Read video metadata: total_frames, fps, duration."""
+    if not video_path:
+        return {"total_frames": 0, "fps": 0.0, "duration": 0.0}
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"total_frames": 0, "fps": 0.0, "duration": 0.0}
@@ -43,6 +45,9 @@ def _compute_visual_signals(
     """
     import numpy as np
 
+    if not video_path:
+        return {"horizon_trend": [], "edge_density_trend": [],
+                "scene_changes": [], "summary": "[No visual data]"}
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return {"horizon_trend": [], "edge_density_trend": [],

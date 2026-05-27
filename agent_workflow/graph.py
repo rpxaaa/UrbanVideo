@@ -3,6 +3,18 @@ from .state import GraphState
 from .reasoner import reasoner_node
 from .verifier import verifier_node
 from .validator import validator_node
+from .config import MAX_VERIFIER_RETRIES, skip_verifier
+
+
+def after_reasoner(state: GraphState) -> str:
+    """Route after reasoner:
+    - Baseline / Recall-Temporal / Goal Detection → validator directly (skip verifier)
+    - All other categories → verifier for evidence consistency check
+    """
+    category = state.get("question_category", "")
+    if skip_verifier(category):
+        return "validator"
+    return "verifier"
 
 
 def after_verifier(state: GraphState) -> str:
@@ -41,7 +53,14 @@ def build_graph():
 
     workflow.set_entry_point("reasoner")
 
-    workflow.add_edge("reasoner", "verifier")
+    workflow.add_conditional_edges(
+        "reasoner",
+        after_reasoner,
+        {
+            "validator": "validator",
+            "verifier": "verifier",
+        }
+    )
 
     workflow.add_conditional_edges(
         "verifier",

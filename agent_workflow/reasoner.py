@@ -29,14 +29,21 @@ CATEGORY_PROMPTS = {
 
     "Progress Evaluation": (
         SPATIAL_COT_BASE +
-        "You are an embodied agent following a sequence of navigation instructions in a first-person urban view.\n\n"
+        "You are a drone following navigation instructions. Determine WHICH step you just completed.\n\n"
         "Question: {question}\n\n"
-        "Focus your [Topological Reasoning] on comparing the final frames with the navigation steps: which step did you "
-        "just complete before arriving at the final viewpoint? Pay strict attention to turns, altitude changes, and landmarks.\n\n"
-        "Progress determination: Compare the visual evidence across the sampled frames with each navigation instruction step. "
-        "Determine which step's completion is best supported by the visible scene state, landmarks, and agent position. "
-        "Do NOT infer progress from frame position or timestamp alone — the last frame does not necessarily mean the task "
-        "is complete. Match against actual visual evidence only.\n\n"
+        "CRITICAL: The last frame is NOT necessarily the end of all instructions. "
+        "The video may end mid-route. Judge ONLY by visual scene evidence, NOT frame position.\n\n"
+        "MOTION CUES (use to judge if a step was executed):\n"
+        "  Turn left  → scene shifts RIGHT.   Turn right → scene shifts LEFT.\n"
+        "  Ascend     → more sky, ground objects shrink.  Descend → more ground, objects enlarge.\n"
+        "  Forward    → center objects grow larger over frames.\n"
+        "  Approach X → X becomes larger/closer.  Reach X → X dominates the final frames.\n\n"
+        "DECISION STEPS:\n"
+        "1. Parse the instruction into Step 1, Step 2, Step 3...\n"
+        "2. For each step, check ALL frames for its expected motion cue. Mark [DONE] or [NOT YET].\n"
+        "3. Identify the LAST step marked [DONE] before the first [NOT YET].\n"
+        "4. If you see clear evidence of step N's completion AND clear evidence that step N+1 has NOT started,\n"
+        "   then step N is your answer. If multiple steps could be [DONE], pick the one with strongest visual support.\n\n"
         "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 
@@ -99,27 +106,21 @@ CATEGORY_PROMPTS = {
     ),
 
     "Goal Detection": (
-        "You are a drone navigating to a specific destination in an urban environment.\n\n"
+        "You are a drone. Determine whether a specific destination is visible from your current position.\n\n"
         "Question: {question}\n\n"
-        "GOAL DETECTION PROTOCOL:\n\n"
-        "STEP 1 — SYSTEMATIC FRAME SCAN:\n"
-        "Go through EACH of the 16 frames in chronological order. For each frame, record:\n"
-        "  Frame N: target BUILDING visible? [YES / NO / PARTIAL]\n"
-        "  Frame N: target FLOOR/LEVEL visible? [YES / NO]\n"
-        "  Frame N: key feature (balcony / entrance / signage) visible? [YES / NO]\n"
+        "FRAME SCAN (go through frames 1-16 chronologically — starting viewpoint is frames 1-6):\n"
+        "For EACH frame, record:\n"
+        "  Frame N: target BUILDING/STRUCTURE visible? [YES / NO / PARTIAL]\n"
+        "  Frame N: target FLOOR/LEVEL/BALCONY visible? [YES / NO]\n"
+        "  Frame N: key FEATURE (sign, entrance, color, shape) visible? [YES / NO]\n"
         "  Frame N: distance to target? [far / mid / near]\n\n"
-        "STEP 2 — BEST EVIDENCE FRAME:\n"
-        "Identify the SINGLE frame that shows the target most clearly. "
-        "If NO frame clearly shows the target, state this explicitly.\n\n"
-        "STEP 3 — ELIMINATION (do this BEFORE selecting an answer):\n"
-        "For EACH option, determine whether you can RULE IT OUT based on visual evidence:\n"
-        "  Option A: [RULED OUT — reason] or [POSSIBLE — evidence]\n"
-        "  Option B: [RULED OUT — reason] or [POSSIBLE — evidence]\n"
-        "  (repeat for all options)\n\n"
-        "STEP 4 — SELECTION:\n"
-        "Among options marked POSSIBLE, select the one with strongest visual evidence. "
-        "If multiple remain possible, choose the one most consistent with the best evidence frame. "
-        "If all options are ruled out, choose the LEAST ruled-out option.\n\n"
+        "BEST EVIDENCE: Which SINGLE frame shows the target most clearly? If no frame clearly\n"
+        "shows the target, state this explicitly.\n\n"
+        "DECISION RULES:\n"
+        "- ALL three = YES in starting frames: destination IS within sight (select 'visible/reached' option).\n"
+        "- Building YES but floor/feature NO: general area visible but exact destination NOT yet reached.\n"
+        "- Building NO (or only PARTIAL): destination NOT within sight from current position.\n"
+        "- If target appears only in LATER frames (after frame 8): you need to move to spot it.\n\n"
         "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 
@@ -149,18 +150,19 @@ CATEGORY_PROMPTS = {
     ),
 
     "Association Reasoning": (
-        SPATIAL_COT_BASE +
-        "You are a drone navigating toward a specific target in an urban environment.\n\n"
+        "You are a drone looking for a specific target. The target itself may NOT be directly visible. "
+        "You must identify which VISIBLE object or location is the best spatial proxy for reaching the target.\n\n"
         "Question: {question}\n\n"
-        "SPATIAL ASSOCIATION protocol — when the target itself is not directly visible, you must identify "
-        "which VISIBLE object serves as the best spatial proxy or intermediate waypoint.\n\n"
-        "In your [Visual Anchors]: enumerate ALL distinctive visible objects (buildings, roads, landmarks).\n"
-        "In your [Coordinate Mapping]: place each object relative to your current viewpoint.\n"
-        "In your [Topological Reasoning]:\n"
-        "1. Which visible object is physically CLOSEST to the target's known or inferred position?\n"
-        "2. Which visible object shares the same spatial context (same building, same side of street, same altitude)?\n"
-        "3. Which object, if you approach it, best positions you for the final leg to the target?\n"
-        "Select the object with the strongest spatial association to the target.\n\n"
+        "METHOD:\n"
+        "1. List ALL distinctive visible objects (buildings, roads, signs, landmarks).\n"
+        "2. For each option, answer: Is this object/location VISIBLE in the frames? [YES / NO]\n"
+        "3. If the target is NOT visible, evaluate each visible candidate by asking:\n"
+        "   - Is it in the SAME building or building complex as the target?\n"
+        "   - Is it on the SAME side of the street/road?\n"
+        "   - Is it at the SAME altitude/floor level?\n"
+        "   - If you approach this candidate, will you be closer to the target?\n"
+        "4. Select the option that is the BEST spatial waypoint — the one that shares the most "
+        "spatial context with the target and positions you for the final approach.\n\n"
         "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 
@@ -168,14 +170,22 @@ CATEGORY_PROMPTS = {
     # ═══ Recall & Perception ═══
 
     "Trajectory Captioning": (
-        "You are a drone. Summarize your complete movement route from the video.\n\n"
+        "You are a drone. Summarize your complete movement route from the video, then match to options.\n\n"
         "Question: {question}\n\n"
-        "Trace your FULL 3D trajectory in chronological order:\n"
-        "1. Starting point: exact location and altitude at the first frame.\n"
-        "2. Movement path: every turn (left/right), altitude change (rise/descend/flat), and direction change.\n"
-        "3. Ending point: exact location and altitude at the last frame.\n"
-        "4. Overall pattern: describe the complete route as a sequence (e.g., 'flew forward over X, "
-        "turned right toward Y, descended to Z').\n\n"
+        "STEP 1 — TRACE YOUR ROUTE chronologically:\n"
+        "  a) Starting point: exact location and altitude (frame 1).\n"
+        "  b) Each movement segment: turn direction, altitude change, what you fly over/past.\n"
+        "  c) Ending point: exact location and altitude (last frame).\n\n"
+        "STEP 2 — SUMMARIZE as one sentence:\n"
+        "  'Started at [X], flew [direction] over/toward [landmarks], then [turned/ascended/descended],\n"
+        "   passed [landmarks], and ended at [Y].'\n\n"
+        "STEP 3 — MATCH TO OPTIONS:\n"
+        "  Compare your summary against EACH option. Eliminate options that:\n"
+        "  - Got the starting point wrong.\n"
+        "  - Got the ending point wrong.\n"
+        "  - Have turns/altitude changes in the WRONG ORDER.\n"
+        "  - Mention landmarks you never passed.\n"
+        "  Select the option that matches your summary most accurately.\n\n"
         "Provide your answer as 'Option: [X]' where X is the letter."
     ),
 
@@ -189,10 +199,16 @@ CATEGORY_PROMPTS = {
     ),
 
     "Duration": (
-        "You are an embodied agent. Compare how long different movement segments take.\n\n"
+        "You are comparing the DURATION of two movement segments in a drone flight video.\n\n"
         "Question: {question}\n\n"
-        "Visually estimate the distance and altitude change for each segment being "
-        "compared. Which one covers more ground or involves more complex maneuvering?\n\n"
+        "COMPARISON METHOD:\n"
+        "1. Identify WHICH frames belong to segment A and which to segment B.\n"
+        "   Look for: when does each segment START (first frame showing that movement)\n"
+        "   and END (last frame before the next distinct movement begins).\n"
+        "2. Count frames: since frames are evenly spaced in time, MORE frames = LONGER duration.\n"
+        "3. Also consider movement complexity: segments with turns, altitude changes,\n"
+        "   or maneuvering around obstacles take more time than straight-line flight.\n"
+        "4. Compare total frame span × complexity for each segment.\n\n"
         "Provide your answer as 'Option: [X]' where X is the letter."
     ),
 
@@ -244,11 +260,20 @@ CATEGORY_PROMPTS = {
     ),
 
     "Sequence Recall": (
-        "Recall the order of events or objects you encountered during navigation.\n\n"
+        "You are watching a drone flight video. The question asks what happens NEXT after a specific event, "
+        "or what the correct order of events is.\n\n"
         "Question: {question}\n\n"
-        "Trace through the video in chronological order to determine the correct "
-        "sequence.\n\n"
-        "Provide your answer as 'Option: [X]' where X is the letter."
+        "TEMPORAL ANCHORING:\n"
+        "1. Scan ALL frames chronologically. Find the EXACT frame range where the described event occurs.\n"
+        "   Note the frame numbers. If the event spans multiple frames, note the start and end.\n"
+        "2. Look ONLY at frames IMMEDIATELY AFTER that event — these show what happened NEXT.\n"
+        "   Do NOT look at frames before the event (they show the past) or far-future frames.\n"
+        "3. Describe what you see in those immediately-following frames.\n"
+        "4. Match your observation against the options.\n\n"
+        "CRITICAL: 'Next step' means what happens RIGHT AFTER the described event, not what happens\n"
+        "at the end of the video. If the question asks about event order, trace frame-by-frame\n"
+        "and note which object/action appears first, second, third.\n\n"
+        "Provide your final answer as 'Option: [X]' where X is the letter."
     ),
 }
 
@@ -259,7 +284,6 @@ DEFAULT_PROMPT = (
     "where X is the option letter."
 )
 
-
 def build_prompt_text(question: str, question_category: str) -> str:
     template = CATEGORY_PROMPTS.get(question_category, DEFAULT_PROMPT)
     return template.format(question=question)
@@ -267,6 +291,8 @@ def build_prompt_text(question: str, question_category: str) -> str:
 
 def _uniform_frames(video_path: str, num_frames: int = 16, max_size: int = 768) -> list[str]:
     """Uniform sampling — used only for BASELINE_CATEGORIES."""
+    if not video_path:
+        return []
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return []
@@ -394,7 +420,7 @@ def reasoner_node(state: GraphState):
         except Exception as e:
             print(f"  -> [Reasoner] API Error on attempt {attempt + 1}: {e}")
             if attempt < max_custom_retries - 1:
-                delay = 3 * (2 ** attempt)  # 指数退避: 3s → 6s → 12s
+                delay = 2 * (2 ** attempt)  # 指数退避: 2s → 4s → 8s
                 print(f"  -> [Reasoner] Retrying in {delay}s...")
                 time.sleep(delay)
             else:
